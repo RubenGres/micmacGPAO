@@ -26,7 +26,7 @@ def arg_parser():
 
     #TODO change to target
     parser.add_argument(
-        'rule',
+        'target',
         type=str,
         help="Target for the makefile"
     )
@@ -80,6 +80,7 @@ def arg_parser():
 
     return parser.parse_known_args()
 
+
 def make_absolute(command):
     # Split the string into a list of substrings separated by spaces
     substrings = command.split()
@@ -99,17 +100,8 @@ def make_absolute(command):
     # Join the substrings back into a single string
     return " ".join(substrings)
 
+
 def parse_makefile(makefile_path):
-    with open(makefile_path) as f:
-        filename = os.path.basename(makefile_path)
-        cmd = filter(lambda x : x.strip() != '' and x.startswith('\t'), f.readlines())
-        cmd = list(cmd)
-        cmds = [x.strip() for x in cmd]
-
-    return cmds
-
-
-def parse_makefile2(makefile_path):
     with open(makefile_path) as f:
         lines = f.readlines()
 
@@ -133,26 +125,26 @@ def parse_makefile2(makefile_path):
 
     return result_dict
 
-def create_project(makefile_dict, target):
+
+# create the project from a makefile_dict and a target, this is a work of art
+def create_project(makefile_path, target):
 
     def build_proj_rec(makefile_dict, jobs, target):
         dependencies = makefile_dict[target]['deps']
 
-        #if no more deps return a Job
-        if not dependencies:
-            cmd = make_absolute(makefile_dict[target]['cmd'])
-            
-            if not cmd:
-                cmd = ';'
-
-            job = Job(target, cmd, dependencies)
-            jobs[target] = job
-            return jobs
-        
         for dependency in dependencies:
-            jobs = build_proj_rec(makefile_dict, jobs, dependency)
+            jobs.update(build_proj_rec(makefile_dict, build_proj_rec(jobs), dependency))
+        
+        cmd = make_absolute(makefile_dict[target]['cmd'])
+        
+        if not cmd:
+            cmd = ';'
 
+        job = Job(target, cmd, dependencies)
+        jobs[target] = job
         return jobs
+
+    makefile_dict = parse_makefile(makefile_path)
 
     jobs = {}
     jobs_dict = build_proj_rec(makefile_dict, jobs, target)
@@ -162,15 +154,8 @@ def create_project(makefile_dict, target):
     return Project(ARGS.project_name, jobs)
 
 
-ARGS, unknown_ARGS = arg_parser()
-
-makefile_path = ARGS.makefile if ARGS.makefile else ARGS.file
-makefile = parse_makefile2(makefile_path)
-project = create_project(makefile, ARGS.rule)
-
-# if we want to save a JSON, stop there
-if ARGS.JSON:
-    #TODO add PID folder in the JSON path
+def save_as_json(ARGS, project):
+    #TODO add PPID folder in the JSON path
     json_path = f"{ARGS.JSON}/MM3D_{ARGS.PPID}.json"
     builder_path = f"{ARGS.JSON}/MM3D_{ARGS.PPID}.pickle"
 
@@ -186,8 +171,8 @@ if ARGS.JSON:
         projects.append(project)
     else:
         projects = [project]
-        # save the project as a pickle file
 
+    # save the project as a pickle file
     with open(builder_path, "wb") as f:
         pickle.dump(projects, f)
 
@@ -197,8 +182,8 @@ if ARGS.JSON:
 
     print(f'GPAO json file saved at {json_path}')
 
-# if we want to send directly to the API
-if ARGS.API:
+
+def send_to_api(ARGS, project):
     builder = Builder([project])
     builder.send_project_to_api(ARGS.API)
 
@@ -210,4 +195,21 @@ if ARGS.API:
     #print("Something went wrong in GPAO")
     #exit(1)
 
-exit(0)
+
+def main():
+    ARGS, unknown_ARGS = arg_parser()
+
+    makefile_path = ARGS.makefile if ARGS.makefile else ARGS.file
+    project = create_project(makefile_path, ARGS.target)
+
+    if ARGS.JSON:
+        save_as_json(project, ARGS)
+
+    if ARGS.API:
+        send_to_api(project, ARGS)
+
+    exit(0)
+
+
+if __name__ == "__main__" :
+    main()
