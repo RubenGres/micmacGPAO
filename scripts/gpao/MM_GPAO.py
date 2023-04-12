@@ -1,17 +1,17 @@
-import argparse
 from pathlib import Path
+import argparse
 import sys
-import click
+import os
+import time
+import glob
 import numpy as np
+import pickle
+from datetime import datetime
 
 from gpao.builder import Builder
 from gpao.project import Project
 from gpao.job import Job
 
-import glob
-import os
-
-from datetime import datetime
 
 def arg_parser():
     """ Extraction des arguments de la ligne de commande """
@@ -21,20 +21,21 @@ def arg_parser():
         'makefile',
         nargs='?',
         default=None,
-        help="makefile"
+        help="Makefile"
+    )
+
+    #TODO change to target
+    parser.add_argument(
+        'rule',
+        type=str,
+        help="Target for the makefile"
     )
 
     parser.add_argument(
         '--file',
         '-f',
         type=str,
-        help="makefile"
-    )
-
-    parser.add_argument(
-        'rule',
-        type=str,
-        help="rule for the makefile"
+        help="Makefile"
     )
 
     parser.add_argument(
@@ -42,13 +43,13 @@ def arg_parser():
         '-j',
         metavar='N',
         type=int,
-        help='an integer for the number of jobs'
+        help='An integer for the number of jobs'
     )
 
     parser.add_argument(
         '--JSON',
         nargs="?",
-        const='MM3D_GPAO.json',
+        const='./',
         type=str,
         help="Path where to save the json file to. If not specified the project will not be save as json. Default : project.json"
     )
@@ -62,13 +63,22 @@ def arg_parser():
     )
 
     parser.add_argument(
-        '--silent',
-        '-s',
-        action='store_true',
-        help="Silent operation; do not print the commands as they are executed."
+        '--PPID',
+        nargs="?",
+        const='0000',
+        type=str,
+        help="PID of the process calling makeGPAO"
+    )
+    
+    parser.add_argument(
+        '--API',
+        nargs="?",
+        const='localhost',
+        type=str,
+        help="URL of the GPAO API, if not specified nothing will be sent to GPAO"
     )
 
-    return parser.parse_args()
+    return parser.parse_known_args()
 
 def make_absolute(command):
     # Split the string into a list of substrings separated by spaces
@@ -89,31 +99,115 @@ def make_absolute(command):
     # Join the substrings back into a single string
     return " ".join(substrings)
 
-ARGS = arg_parser()
+def parse_makefile(makefile_path):
+    with open(makefile_path) as f:
+        filename = os.path.basename(makefile_path)
+        cmd = filter(lambda x : x.strip() != '' and x.startswith('\t'), f.readlines())
+        cmd = list(cmd)
+        cmds = [x.strip() for x in cmd]
 
-cmds = dict()
+    return cmds
+
+
+def parse_makefile2(makefile_path):
+    with open(makefile_path) as f:
+        lines = f.readlines()
+
+    result_dict = {}
+    current_key = None
+    for line in lines:        
+        # if line is empty, continue
+        if not line.strip():
+            continue
+
+        if line.startswith('\t'):
+            if current_key is None:
+                raise ValueError('File format is invalid')
+            result_dict[current_key]['cmd'] = make_absolute(line.strip())
+        elif ':' in line:
+                current_key, deps = line.split(':')
+                current_key = current_key.strip()
+                result_dict[current_key] = dict(deps=deps.strip().split(), cmd=None)
+        else:
+            raise ValueError('File format is invalid')
+
+    return result_dict
+
+def create_project(makefile_dict, target):
+
+    def build_proj_rec(makefile_dict, jobs, target):
+        dependencies = makefile_dict[target]['deps']
+
+        #if no more deps return a Job
+        if not dependencies:
+            cmd = make_absolute(makefile_dict[target]['cmd'])
+            
+            if not cmd:
+                cmd = ';'
+
+            job = Job(target, cmd, dependencies)
+            jobs[target] = job
+            return jobs
+        
+        for dependency in dependencies:
+            jobs = build_proj_rec(makefile_dict, jobs, dependency)
+
+        return jobs
+
+    jobs = {}
+    jobs_dict = build_proj_rec(makefile_dict, jobs, target)
+
+    jobs=jobs_dict.values()
+
+    return Project(ARGS.project_name, jobs)
+
+
+ARGS, unknown_ARGS = arg_parser()
 
 makefile_path = ARGS.makefile if ARGS.makefile else ARGS.file
+makefile = parse_makefile2(makefile_path)
+project = create_project(makefile, ARGS.rule)
 
-with open(makefile_path) as mf:
-    filename = os.path.basename(makefile_path)
-    cmd = filter(lambda x : x.strip() != '' and x.startswith('\t'), mf.read().split('\n'))
-    cmd = list(cmd)
-    cmds = [x.strip() for x in cmd]
+# if we want to save a JSON, stop there
+if ARGS.JSON:
+    #TODO add PID folder in the JSON path
+    json_path = f"{ARGS.JSON}/MM3D_{ARGS.PPID}.json"
+    builder_path = f"{ARGS.JSON}/MM3D_{ARGS.PPID}.pickle"
 
-makefile = dict(
-    all=cmds
-)
+    # check if builder JSON exists
+    if os.path.exists(json_path):
+        # open the last builder pickle file
+        with open(builder_path, "rb") as f:
+            projects = pickle.load(f)
 
-jobs = []
-for i, cmd in enumerate(makefile[ARGS.rule]):
-    job = Job(f'MM3D_{i}', make_absolute(cmd))
-    jobs.append(job)
+        # add dependencies
+        for p in projects:
+            project.add_dependency(p)
+        projects.append(project)
+    else:
+        projects = [project]
+        # save the project as a pickle file
 
-project = Project(ARGS.project_name, jobs)
+    with open(builder_path, "wb") as f:
+        pickle.dump(projects, f)
 
-builder = Builder([project])
+    # save/override GPAO JSON file
+    builder = Builder(projects)
+    builder.save_as_json(json_path)
 
-if(ARGS.JSON):
-    builder.save_as_json(ARGS.JSON)
-    print(f'GPAO json file saved at {ARGS.JSON}')
+    print(f'GPAO json file saved at {json_path}')
+
+# if we want to send directly to the API
+if ARGS.API:
+    builder = Builder([project])
+    builder.send_project_to_api(ARGS.API)
+
+    # wait for it to complete
+    # TODO change later using the API
+    time.sleep(30)
+
+    # TODO if failed
+    #print("Something went wrong in GPAO")
+    #exit(1)
+
+exit(0)
