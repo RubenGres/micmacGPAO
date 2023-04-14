@@ -247,8 +247,6 @@ def main():
     if ARGS.JSON:
         save_as_json(ARGS, project)
 
-    time.sleep(5)
-
     if ARGS.API:
         send_to_api(ARGS, project)
 
