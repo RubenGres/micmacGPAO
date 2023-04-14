@@ -2,6 +2,8 @@ from pathlib import Path
 import argparse
 import sys
 import os
+import requests
+import json
 import time
 import glob
 import numpy as np
@@ -24,7 +26,6 @@ def arg_parser():
         help="Makefile"
     )
 
-    #TODO change to target
     parser.add_argument(
         'target',
         type=str,
@@ -39,14 +40,6 @@ def arg_parser():
     )
 
     parser.add_argument(
-        '--jobs',
-        '-j',
-        metavar='N',
-        type=int,
-        help='An integer for the number of jobs'
-    )
-
-    parser.add_argument(
         '--JSON',
         nargs="?",
         const='./',
@@ -57,7 +50,7 @@ def arg_parser():
     parser.add_argument(
         '--project_name',
         nargs="?",
-        const='MicMac_project',
+        const='makefile_gpao_project',
         type=str,
         help="Name of the associated project in GPAO"
     )
@@ -72,10 +65,39 @@ def arg_parser():
     
     parser.add_argument(
         '--API',
+        action='store_true',
+        help="If set, will send the project directly to the API"
+    )
+
+    parser.add_argument(
+        '--API_URL',
         nargs="?",
         const='localhost',
         type=str,
-        help="URL of the GPAO API, if not specified nothing will be sent to GPAO"
+        help="URL of the GPAO API"
+    )
+
+    parser.add_argument(
+        '--API_PROTOCOL',
+        nargs="?",
+        const='http://',
+        type=str,
+        help="Protocol of the GPAO API"
+    )
+
+    parser.add_argument(
+        '--API_PORT',
+        nargs="?",
+        const='8080',
+        type=str,
+        help="Port of the GPAO API"
+    )
+
+    parser.add_argument(
+        '--await',
+        dest='wait',
+        action='store_true',
+        help='Wait for all the jobs to be finished in GPAO (only if using the --API tag)'
     )
 
     return parser.parse_known_args()
@@ -119,7 +141,7 @@ def parse_makefile(makefile_path):
         elif ':' in line:
                 current_key, deps = line.split(':')
                 current_key = current_key.strip()
-                result_dict[current_key] = dict(deps=deps.strip().split(), cmd=None)
+                result_dict[current_key] = dict(deps=deps.strip().split(), cmd='true')
         else:
             raise ValueError('File format is invalid')
 
@@ -127,53 +149,53 @@ def parse_makefile(makefile_path):
 
 
 # create the project from a makefile_dict and a target, this is a work of art
-def create_project(makefile_path, target):
+def create_project(makefile_path, target, project_name):
 
-    def build_proj_rec(makefile_dict, jobs, target):
+    makefile_dict = parse_makefile(makefile_path)
+    jobs = {}
+
+    def build_proj_rec(target):
         dependencies = makefile_dict[target]['deps']
-
+        
         for dependency in dependencies:
-            jobs.update(build_proj_rec(makefile_dict, build_proj_rec(jobs), dependency))
+            if dependency not in jobs.keys():
+                new_jobs = build_proj_rec(dependency)
+                jobs.update(new_jobs)
         
         cmd = make_absolute(makefile_dict[target]['cmd'])
         
-        if not cmd:
-            cmd = ';'
+        deps = [jobs[k] for k in dependencies]
 
-        job = Job(target, cmd, dependencies)
+        job = Job(target, cmd, deps)
         jobs[target] = job
+
         return jobs
 
-    makefile_dict = parse_makefile(makefile_path)
+    project_jobs = build_proj_rec(target).values()
 
-    jobs = {}
-    jobs_dict = build_proj_rec(makefile_dict, jobs, target)
-
-    jobs=jobs_dict.values()
-
-    return Project(ARGS.project_name, jobs)
+    return Project(project_name, project_jobs)
 
 
 def save_as_json(ARGS, project):
-    #TODO add PPID folder in the JSON path
     json_path = f"{ARGS.JSON}/MM3D_{ARGS.PPID}.json"
-    builder_path = f"{ARGS.JSON}/MM3D_{ARGS.PPID}.pickle"
+    pickle_path = f"{ARGS.JSON}/MM3D_{ARGS.PPID}.pickle"
 
     # check if builder JSON exists
     if os.path.exists(json_path):
         # open the last builder pickle file
-        with open(builder_path, "rb") as f:
+        with open(pickle_path, "rb") as f:
             projects = pickle.load(f)
 
         # add dependencies
-        for p in projects:
-            project.add_dependency(p)
+        for i, p in enumerate(projects):
+            project.add_dependency({"id": i})
+
         projects.append(project)
     else:
         projects = [project]
 
     # save the project as a pickle file
-    with open(builder_path, "wb") as f:
+    with open(pickle_path, "wb") as f:
         pickle.dump(projects, f)
 
     # save/override GPAO JSON file
@@ -185,28 +207,50 @@ def save_as_json(ARGS, project):
 
 def send_to_api(ARGS, project):
     builder = Builder([project])
-    builder.send_project_to_api(ARGS.API)
 
-    # wait for it to complete
-    # TODO change later using the API
-    time.sleep(30)
+    URL_API = f"{ARGS.API_PROTOCOL}://{ARGS.API_URL}:{ARGS.API_PORT}"
 
-    # TODO if failed
-    #print("Something went wrong in GPAO")
-    #exit(1)
+    builder.send_project_to_api(URL_API)
 
+    project_name = project.get_name()
+    if ARGS.wait:
+        project_done = False
+        while not project_done:
+            response = requests.get(f"{URL_API}/api/projects")
+
+            data = json.loads(response.text)
+            filtered_data = [project for project in data if project['name'] == project_name]
+
+            if len(filtered_data) == 0:
+                continue
+
+            elif len(filtered_data) > 1:
+                raise KeyError(f'there is multiple projects with the name {project_name}')
+            
+            project_status = filtered_data[0]['status']
+            
+            if project_status == 'failed':
+                raise RuntimeError('project failed, more info can be found in the GPAO monitor')
+            
+            project_done = project_status == 'done'
+
+            if not project_done:
+                time.sleep(5)
 
 def main():
     ARGS, unknown_ARGS = arg_parser()
 
     makefile_path = ARGS.makefile if ARGS.makefile else ARGS.file
-    project = create_project(makefile_path, ARGS.target)
+    
+    project = create_project(makefile_path, ARGS.target, ARGS.project_name)
 
     if ARGS.JSON:
-        save_as_json(project, ARGS)
+        save_as_json(ARGS, project)
+
+    time.sleep(5)
 
     if ARGS.API:
-        send_to_api(project, ARGS)
+        send_to_api(ARGS, project)
 
     exit(0)
 
