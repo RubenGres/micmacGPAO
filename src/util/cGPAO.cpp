@@ -517,7 +517,17 @@ bool launchMake(const string &i_makefile, const string &i_rule, unsigned int i_n
 		ELISE_fp::copy_file( i_makefile, makefileCopyName, true );
 	#endif
 
-	std::string aCom = string("\"")+(g_externalToolHandler.get( "makeGPAO" ).callName())+"\" " + i_rule + " -f \"" + i_makefile + "\" " + nbJobsStr + " " + i_options;
+    string makeCommand;
+    //TODO pass UseGpaoApi as a parameter when calling mm3d
+    if (true) {
+        makeCommand = "makeGPAO";
+    }
+    else
+    {
+        makeCommand = "make";
+    }
+
+	std::string aCom = string("\"")+(g_externalToolHandler.get(makeCommand).callName())+"\" " + i_rule + " -f \"" + i_makefile + "\" " + nbJobsStr + " " + i_options;
 	return System(aCom, !i_stopCurrentProgramOnFail) == EXIT_SUCCESS;
 }
 
