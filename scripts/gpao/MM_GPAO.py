@@ -20,15 +20,9 @@ def arg_parser():
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
-        'makefile',
+        'target',
         nargs='?',
         default=None,
-        help="Makefile"
-    )
-
-    parser.add_argument(
-        'target',
-        type=str,
         help="Target for the makefile"
     )
 
@@ -80,7 +74,7 @@ def arg_parser():
     parser.add_argument(
         '--API_PROTOCOL',
         nargs="?",
-        const='http://',
+        const='http',
         type=str,
         help="Protocol of the GPAO API"
     )
@@ -100,8 +94,20 @@ def arg_parser():
         help='Wait for all the jobs to be finished in GPAO (only if using the --API tag)'
     )
 
+    parser.add_argument(
+        '--wd',
+        nargs="?",
+        dest='working_dir',
+        const=None,
+        type=str,
+        help="working directory for the command"
+    )
+
     return parser.parse_known_args()
 
+def move_to_working_dir(command, working_dir):
+    command = command.replace('"', '\\"')
+    return f'bash -c "cd {working_dir} && {command}"'
 
 def make_absolute(command):
     # Split the string into a list of substrings separated by spaces
@@ -137,7 +143,7 @@ def parse_makefile(makefile_path):
         if line.startswith('\t'):
             if current_key is None:
                 raise ValueError('File format is invalid')
-            result_dict[current_key]['cmd'] = make_absolute(line.strip())
+            result_dict[current_key]['cmd'] = line.strip()
         elif ':' in line:
                 current_key, deps = line.split(':')
                 current_key = current_key.strip()
@@ -148,8 +154,8 @@ def parse_makefile(makefile_path):
     return result_dict
 
 
-# create the project from a makefile_dict and a target, this is a work of art
-def create_project(makefile_path, target, project_name):
+# create the project from a makefile_dict and a target recursively, this hurt my brain to make
+def create_project(makefile_path, target, project_name, working_dir=None):
 
     makefile_dict = parse_makefile(makefile_path)
     jobs = {}
@@ -163,15 +169,22 @@ def create_project(makefile_path, target, project_name):
                 jobs.update(new_jobs)
         
         cmd = make_absolute(makefile_dict[target]['cmd'])
-        
+
+        if working_dir:
+            cmd = move_to_working_dir(cmd, working_dir)
+
         deps = [jobs[k] for k in dependencies]
 
-        job = Job(target, cmd, deps)
-        jobs[target] = job
+        if (target != "all"):
+            job = Job(target, cmd, deps)
+            jobs[target] = job
 
         return jobs
 
     project_jobs = build_proj_rec(target).values()
+
+    if len(project_jobs) == 0:
+        return None
 
     return Project(project_name, project_jobs)
 
@@ -205,50 +218,86 @@ def save_as_json(ARGS, project):
     print(f'GPAO json file saved at {json_path}')
 
 
+def wait_for_project(project_name, URL_API):
+    project_done = False
+
+    while not project_done:
+        response = requests.get(f"{URL_API}/api/projects")
+
+        data = json.loads(response.text)
+        filtered_data = [project for project in data if project['name'].startswith(project_name)]
+
+        if len(filtered_data) == 0:
+            # no project containing this name
+            continue
+
+        elif len(filtered_data) == 1:
+            project = filtered_data[0]
+
+        else:
+            def get_key(i, filtered_data):
+                split_name = filtered_data[i]['name'].split('_')
+                if len(split_name) > 1 and split_name[-1].isnumeric():
+                    return int(split_name[-1])
+                else:
+                    return -1
+
+            max_index = max(range(len(filtered_data)), key=lambda i: get_key(i, filtered_data))
+            project = filtered_data[max_index]
+        
+        if project['status'] == 'failed':
+            raise RuntimeError('project failed, more info can be found in the GPAO monitor')
+        
+        project_done = project['status'] == 'done'
+        if not project_done:
+            time.sleep(1)
+
+    return 0
+    
+
 def send_to_api(ARGS, project):
     builder = Builder([project])
 
     URL_API = f"{ARGS.API_PROTOCOL}://{ARGS.API_URL}:{ARGS.API_PORT}"
 
     builder.send_project_to_api(URL_API)
-
-    project_name = project.get_name()
+    
     if ARGS.wait:
-        project_done = False
-        while not project_done:
-            response = requests.get(f"{URL_API}/api/projects")
-
-            data = json.loads(response.text)
-            filtered_data = [project for project in data if project['name'] == project_name]
-
-            if len(filtered_data) == 0:
-                continue
-
-            elif len(filtered_data) > 1:
-                raise KeyError(f'there is multiple projects with the name {project_name}')
-            
-            project_status = filtered_data[0]['status']
-            
-            if project_status == 'failed':
-                raise RuntimeError('project failed, more info can be found in the GPAO monitor')
-            
-            project_done = project_status == 'done'
-
-            if not project_done:
-                time.sleep(5)
+        wait_for_project(project.get_name(), URL_API)
+        
 
 def main():
+    print(f"received command {' '.join(sys.argv)}")
+
     ARGS, unknown_ARGS = arg_parser()
 
-    makefile_path = ARGS.makefile if ARGS.makefile else ARGS.file
+    makefile_path = ARGS.file
+    if not ARGS.file:
+        filenames = ["GNUmakefile", "makefile", "Makefile"]
+
+        for filename in filenames:
+            if os.path.exists(filename):
+                makefile_path = filename
+                break
+
+    if(not makefile_path):
+       sys.exit("ERROR: no makefile provided. Use --help to get help on the command")
+
+    print(f'parsing makefile from {makefile_path}')
     
-    project = create_project(makefile_path, ARGS.target, ARGS.project_name)
+    target = ARGS.target or "all"
+    project = create_project(makefile_path, target, ARGS.project_name, working_dir=ARGS.working_dir)
 
-    if ARGS.JSON:
-        save_as_json(ARGS, project)
+    if project is not None:
+        if ARGS.JSON:
+            print("MM_GPAO: saving as json file...")
+            save_as_json(ARGS, project)
 
-    if ARGS.API:
-        send_to_api(ARGS, project)
+        if ARGS.API:
+            print("MM_GPAO: sending jobs to the GPAO...")
+            send_to_api(ARGS, project)
+    else:
+        print("No job in the current makefile, nothing was sent to GPAO.")
 
     exit(0)
 
