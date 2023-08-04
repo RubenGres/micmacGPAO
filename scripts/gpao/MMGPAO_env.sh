@@ -27,3 +27,5 @@ fi
 if [ -z "$MM_GPAO_PY" ]; then
   export MM_GPAO_PY=$MMGPAO_path/MM_GPAO.py
 fi
+
+alias mm3dGPAO="/Volumes/ESPACE_TRAVAIL_Puma/DANI/RUBEN/MM3D/micmac/bin/mm3d"

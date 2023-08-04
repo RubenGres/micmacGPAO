@@ -9,6 +9,7 @@ import glob
 import numpy as np
 import pickle
 from datetime import datetime
+from difflib import SequenceMatcher
 
 from gpao.builder import Builder
 from gpao.project import Project
@@ -100,14 +101,46 @@ def arg_parser():
         dest='working_dir',
         const=None,
         type=str,
-        help="working directory for the command"
+        help="base working directory for the command (user defined)"
+    )
+
+    parser.add_argument(
+        '--userdir',
+        dest='user_dir',
+        type=str,
+        help="absolute path of the user directory from where the command is called"
+    )
+
+    parser.add_argument(
+        '--conda_env',
+        nargs="?",
+        dest='conda_env',
+        const=None,
+        type=str,
+        help="conda virtual env name"
     )
 
     return parser.parse_known_args()
 
-def move_to_working_dir(command, working_dir):
-    command = command.replace('"', '\\"')
-    return f'bash -c "cd {working_dir} && {command}"'
+def reconstruct_url(abs_path, cwd_path):
+    match = SequenceMatcher(None, abs_path, cwd_path).find_longest_match()
+    return cwd_path + abs_path[match.a + match.size:]
+
+def prefix_command(command, working_dir, user_dir, conda_env):
+    fixed_dir = working_dir
+
+    if user_dir:
+        fixed_dir = reconstruct_url(user_dir, working_dir)
+    
+    cmd = f'cd {fixed_dir} && {command}'
+
+    if conda_env:
+        cmd = f'source ~/.bashrc && conda activate {conda_env} && {cmd}'
+
+    cmd = cmd.replace('"', '\\"')
+    cmd = f'bash -c "{cmd}"'
+
+    return cmd
 
 def make_absolute(command):
     # Split the string into a list of substrings separated by spaces
@@ -155,7 +188,7 @@ def parse_makefile(makefile_path):
 
 
 # create the project from a makefile_dict and a target recursively, this hurt my brain to make
-def create_project(makefile_path, target, project_name, working_dir=None):
+def create_project(makefile_path, target, project_name, working_dir=None, conda_env=None, user_dir=None):
 
     makefile_dict = parse_makefile(makefile_path)
     jobs = {}
@@ -168,10 +201,11 @@ def create_project(makefile_path, target, project_name, working_dir=None):
                 new_jobs = build_proj_rec(dependency)
                 jobs.update(new_jobs)
         
-        cmd = make_absolute(makefile_dict[target]['cmd'])
+        #cmd = make_absolute(makefile_dict[target]['cmd'])
+        cmd = makefile_dict[target]['cmd']
 
         if working_dir:
-            cmd = move_to_working_dir(cmd, working_dir)
+            cmd = prefix_command(cmd, working_dir, user_dir, conda_env)
 
         deps = [jobs[k] for k in dependencies]
 
@@ -215,8 +249,6 @@ def save_as_json(ARGS, project):
     builder = Builder(projects)
     builder.save_as_json(json_path)
 
-    print(f'GPAO json file saved at {json_path}')
-
 
 def wait_for_project(project_name, URL_API):
     project_done = False
@@ -250,7 +282,7 @@ def wait_for_project(project_name, URL_API):
         
         project_done = project['status'] == 'done'
         if not project_done:
-            time.sleep(1)
+            time.sleep(0.1)
 
     return 0
     
@@ -267,8 +299,6 @@ def send_to_api(ARGS, project):
         
 
 def main():
-    print(f"received command {' '.join(sys.argv)}")
-
     ARGS, unknown_ARGS = arg_parser()
 
     makefile_path = ARGS.file
@@ -282,19 +312,16 @@ def main():
 
     if(not makefile_path):
        sys.exit("ERROR: no makefile provided. Use --help to get help on the command")
-
-    print(f'parsing makefile from {makefile_path}')
     
     target = ARGS.target or "all"
-    project = create_project(makefile_path, target, ARGS.project_name, working_dir=ARGS.working_dir)
+    project = create_project(makefile_path, target, ARGS.project_name, working_dir=ARGS.working_dir, conda_env=ARGS.conda_env, user_dir=ARGS.user_dir)
 
     if project is not None:
         if ARGS.JSON:
-            print("MM_GPAO: saving as json file...")
             save_as_json(ARGS, project)
 
         if ARGS.API:
-            print("MM_GPAO: sending jobs to the GPAO...")
+            print(f"MM_GPAO: sending {len(project.jobs)} jobs to the GPAO... (project: {ARGS.project_name})")
             send_to_api(ARGS, project)
     else:
         print("No job in the current makefile, nothing was sent to GPAO.")
